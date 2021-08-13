@@ -2,7 +2,7 @@ use anyhow::{bail, Context, Result};
 use bitcoin::{
     consensus::{deserialize, serialize},
     hashes::hex::{FromHex, ToHex},
-    BlockHash, Txid,
+    BlockHash, OutPoint, Txid,
 };
 use rayon::prelude::*;
 use serde_derive::Deserialize;
@@ -18,7 +18,7 @@ use crate::{
     merkle::Proof,
     metrics::Histogram,
     signals::Signal,
-    status::ScriptHashStatus,
+    status::{OutPointStatus, ScriptHashStatus},
     tracker::Tracker,
     types::ScriptHash,
 };
@@ -33,6 +33,7 @@ const UNKNOWN_FEE: isize = -1; // (allowed by Electrum protocol)
 pub struct Client {
     tip: Option<BlockHash>,
     scripthashes: HashMap<ScriptHash, ScriptHashStatus>,
+    outpoints: HashMap<OutPoint, OutPointStatus>,
 }
 
 #[derive(Deserialize)]
@@ -168,7 +169,25 @@ impl Rpc {
                 }
             })
             .collect::<Result<Vec<Value>>>()
-            .context("failed to update status")?;
+            .context("failed to update scripthash status")?;
+
+        notifications.extend(
+            client
+                .outpoints
+                .par_iter_mut()
+                .filter_map(|(outpoint, status)| -> Option<Result<Value>> {
+                    match self.tracker.update_outpoint_status(status, &self.daemon) {
+                        Ok(true) => Some(Ok(notification(
+                            "blockchain.outpoint.subscribe",
+                            &[json!([outpoint.txid, outpoint.vout]), json!(status)],
+                        ))),
+                        Ok(false) => None, // outpoint status is the same
+                        Err(e) => Some(Err(e)),
+                    }
+                })
+                .collect::<Result<Vec<Value>>>()
+                .context("failed to update scripthash status")?,
+        );
 
         if let Some(old_tip) = client.tip {
             let new_tip = self.tracker.chain().tip();
@@ -294,6 +313,28 @@ impl Rpc {
             Entry::Vacant(e) => e.insert(self.new_status(scripthash)?).statushash(),
         };
         Ok(json!(result))
+    }
+
+    fn outpoint_subscribe(&self, client: &mut Client, (txid, vout): (Txid, u32)) -> Result<Value> {
+        let outpoint = OutPoint::new(txid, vout);
+        Ok(match client.outpoints.entry(outpoint) {
+            Entry::Occupied(e) => json!(e.get()),
+            Entry::Vacant(e) => {
+                let outpoint = OutPoint::new(txid, vout);
+                let mut status = OutPointStatus::new(outpoint);
+                self.tracker
+                    .update_outpoint_status(&mut status, &self.daemon)?;
+                json!(e.insert(status))
+            }
+        })
+    }
+
+    fn outpoint_unsubscribe(
+        &self,
+        client: &mut Client,
+        (txid, vout): (Txid, u32),
+    ) -> Result<Value> {
+        Ok(json!(client.outpoints.remove(&OutPoint::new(txid, vout))))
     }
 
     fn new_status(&self, scripthash: ScriptHash) -> Result<ScriptHashStatus> {
@@ -430,6 +471,8 @@ impl Rpc {
                 Call::HeadersSubscribe => self.headers_subscribe(client),
                 Call::MempoolFeeHistogram => self.get_fee_histogram(),
                 Call::PeersSubscribe => Ok(json!([])),
+                Call::OutPointSubscribe(args) => self.outpoint_subscribe(client, args),
+                Call::OutPointUnsubscribe(args) => self.outpoint_unsubscribe(client, args),
                 Call::Ping => Ok(Value::Null),
                 Call::RelayFee => self.relayfee(),
                 Call::ScriptHashGetBalance(args) => self.scripthash_get_balance(client, args),
@@ -463,12 +506,13 @@ enum Call {
     Banner,
     BlockHeader((usize,)),
     BlockHeaders((usize, usize)),
-    TransactionBroadcast((String,)),
     Donation,
     EstimateFee((u16,)),
     Features,
     HeadersSubscribe,
     MempoolFeeHistogram,
+    OutPointSubscribe((Txid, u32)), // TODO: support spk_hint
+    OutPointUnsubscribe((Txid, u32)),
     PeersSubscribe,
     Ping,
     RelayFee,
@@ -476,6 +520,7 @@ enum Call {
     ScriptHashGetHistory((ScriptHash,)),
     ScriptHashListUnspent((ScriptHash,)),
     ScriptHashSubscribe((ScriptHash,)),
+    TransactionBroadcast((String,)),
     TransactionGet(TxGetArgs),
     TransactionGetMerkle((Txid, usize)),
     Version((String, Version)),
@@ -493,6 +538,8 @@ impl Call {
             "blockchain.scripthash.get_history" => Call::ScriptHashGetHistory(convert(params)?),
             "blockchain.scripthash.listunspent" => Call::ScriptHashListUnspent(convert(params)?),
             "blockchain.scripthash.subscribe" => Call::ScriptHashSubscribe(convert(params)?),
+            "blockchain.outpoint.subscribe" => Call::OutPointSubscribe(convert(params)?),
+            "blockchain.outpoint.unsubscribe" => Call::OutPointUnsubscribe(convert(params)?),
             "blockchain.transaction.broadcast" => Call::TransactionBroadcast(convert(params)?),
             "blockchain.transaction.get" => Call::TransactionGet(convert(params)?),
             "blockchain.transaction.get_merkle" => Call::TransactionGetMerkle(convert(params)?),
